@@ -8,7 +8,15 @@ A lightweight Python script to monitor local disk space usage, calculate availab
 * **Threshold Alerts:** Notifies you if your storage utilization exceeds a specific limit (e.g., 80%).
 
 ## Requirements
-* Python 3.x (no external pip packages required, uses standard `shutil` library).
+
+- **Operating System**: Windows 10 / 11 (uses Windows-specific C-types APIs for Recycle Bin cleanup and file system paths).
+- **Python Version**: Python 3.8 or higher.
+- **Dependencies**: None! Uses only Python's standard built-in libraries:
+  - `ctypes` (Interfacing with Windows Shell APIs)
+  - `shutil` (Disk usage & folder operations)
+  - `os` & `pathlib` (Environment variables & path management)
+- **Permissions**: Administrator privileges recommended (required for cleaning system caches like `Prefetch` and `SoftwareDistribution`).
+
 
 ## Usage
 Run the script directly from your terminal:
