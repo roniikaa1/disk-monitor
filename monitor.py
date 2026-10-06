@@ -1,189 +1,705 @@
-# Import necessary modules
-import ctypes     # Allows us to call core Windows C-level functions (like checking admin or emptying recycle bin)
-import os         # Used for interacting with the operating system, like reading environment variables
-import shutil     # High-level file operations, used here for checking disk space and deleting whole folders
-from pathlib import Path # Modern, cleaner way to handle file paths in Python
-from typing import Tuple, List # Used for type hinting, which helps IDEs understand what functions return
+from __future__ import annotations
+import ctypes
+import logging
+import os
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Tuple
 
-# --- Configuration Section ---
-DRIVE: str = "C:\\"              # The main hard drive we want to monitor and clean
-THRESHOLD_PERCENT: float = 10.0  # If free space drops below this percentage, trigger automatic cleanup
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DRIVE = Path("C:\\")
+THRESHOLD_PERCENT = 10.0
+
+# Safety settings
+DRY_RUN = False
+
+# Cleanup options
+CLEAN_RECYCLE_BIN = True
+CLEAN_BROWSER_CACHES = True
+CLEAN_WINDOWS_UPDATE_CACHE = True
+CLEAN_PREFETCH = False
+
+# Only crash dumps older than this many days are deleted.
+CRASH_DUMP_MAX_AGE_DAYS = 30
+
+# Log file
+LOG_FILE = Path("disk_cleanup.log")
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# DATA STRUCTURES
+# ============================================================
+
+@dataclass
+class CleanupStats:
+    files_deleted: int = 0
+    directories_deleted: int = 0
+    files_failed: int = 0
+    directories_failed: int = 0
+    bytes_recovered: int = 0
+
+    @property
+    def total_items_deleted(self) -> int:
+        return self.files_deleted + self.directories_deleted
+
+    @property
+    def recovered_gb(self) -> float:
+        return self.bytes_recovered / (1024 ** 3)
+
+
+# ============================================================
+# ADMIN CHECK
+# ============================================================
 
 def is_admin() -> bool:
-    """Check if the script is running with administrator privileges."""
+    """Return True if the script is running with administrator privileges."""
+
+    if os.name != "nt":
+        return False
+
     try:
-        # Calls the Windows Shell API to check if the current user has admin rights.
-        # Returns a non-zero value if true, so we check if it is not equal to (!=) 0.
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        # If the check fails for any reason, safely assume we are not admin.
+    except Exception as exc:
+        logger.exception("Administrator check failed: %s", exc)
         return False
 
 
-def get_free_space(drive: str) -> Tuple[float, float]:
-    """Returns the free space percentage and free gigabytes of the specified drive."""
-    # shutil.disk_usage returns a tuple of (total_bytes, used_bytes, free_bytes)
+# ============================================================
+# DISK INFORMATION
+# ============================================================
+
+def get_free_space(drive: Path) -> Tuple[float, float]:
+    """
+    Return:
+        free percentage
+        free GB
+    """
+
     total, used, free = shutil.disk_usage(drive)
-    
-    # Calculate percentage: (Free bytes divided by Total bytes) times 100
+
+    if total == 0:
+        return 0.0, 0.0
+
     free_percent = (free / total) * 100
-    
-    # Convert bytes to Gigabytes. 
-    # 1 Kilobyte = 1024 bytes, 1 Megabyte = 1024^2 bytes, 1 Gigabyte = 1024^3 bytes.
-    free_gb = free / (1024**3)
-    
+    free_gb = free / (1024 ** 3)
+
     return free_percent, free_gb
 
 
-def get_cleanup_paths() -> List[Path]:
-    """Returns a list of high-yield junk folder paths to clean."""
-    # We use environment variables (like %TEMP% or %LOCALAPPDATA%) because 
-    # these folders might be in different places on different computers.
-    paths = [
-        # Standard Temporary Files
-        r"%TEMP%",                                     # Current user's temp folder
-        r"%SystemRoot%\Temp",                          # Windows system temp folder (usually C:\Windows\Temp)
-        
-        # System Caches (Requires Admin)
-        r"%SystemRoot%\SoftwareDistribution\Download", # Windows Update downloaded files cache
-        r"%SystemRoot%\Prefetch",                      # App launch prefetch data
-        
-        # Application Crash Dumps
-        r"%LOCALAPPDATA%\CrashDumps",                  # Where apps save memory dumps when they crash
-        r"%ProgramData%\Microsoft\Windows\WER\ReportArchive", # Windows Error Reporting archive
-        
-        # Browser Caches
-        r"%LOCALAPPDATA%\Google\Chrome\User Data\Default\Cache\Cache_Data", # Chrome internet cache
-        r"%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Cache\Cache_Data", # Edge internet cache
-    ]
-    
-    # os.path.expandvars translates variables like %TEMP% into actual paths (e.g., C:\Users\name\AppData\Local\Temp)
-    # We wrap them in Path() objects to make them easier to work with later.
-    return [Path(os.path.expandvars(p)) for p in paths]
+def get_disk_usage(drive: Path) -> Tuple[float, float, float]:
+    """Return total, used and free disk space in GB."""
 
+    total, used, free = shutil.disk_usage(drive)
 
-def clear_junk_folders() -> None:
-    """Deletes files and subdirectories from all targeted junk folders."""
-    cleanup_paths = get_cleanup_paths()
-
-    # Trackers to see how much we accomplished
-    deleted_files = 0
-    deleted_dirs = 0
-    failed_count = 0
-
-    print("--- Deleting system junk and cache files ---")
-    
-    # Loop through every folder in our list
-    for cache_dir in cleanup_paths:
-        # If the folder doesn't exist on this PC, skip it
-        if not cache_dir.exists():
-            continue
-
-        print(f"Cleaning: {cache_dir}")
-        
-        # OUTER TRY-EXCEPT: Checks if we have permission to LOOK inside the folder
-        try:
-            # iterdir() gives us a list of everything inside the folder
-            for item in cache_dir.iterdir():
-                
-                # INNER TRY-EXCEPT: Checks if we have permission to DELETE this specific file
-                try:
-                    # If the item is a file or a shortcut (symlink), delete it using unlink()
-                    if item.is_file() or item.is_symlink():
-                        item.unlink(missing_ok=True)
-                        deleted_files += 1
-                        
-                    # If the item is a folder, delete it and everything inside it using rmtree()
-                    elif item.is_dir():
-                        shutil.rmtree(item)
-                        deleted_dirs += 1
-                        
-                except (PermissionError, OSError):
-                    # It's totally normal for some files to fail. 
-                    # If Windows or an app is currently using a file, it gets "locked" and cannot be deleted.
-                    failed_count += 1
-                    
-        except PermissionError:
-            # This triggers if we don't have Admin rights to read folders like C:\Windows\Prefetch
-            print("  -> Skipped: Access Denied (Run terminal as Administrator to clean this folder)")
-
-    # Print final summary
-    print(
-        f"\nSuccessfully deleted: {deleted_files} files and {deleted_dirs} folders. "
-        f"(Skipped in-use/locked: {failed_count})"
+    return (
+        total / (1024 ** 3),
+        used / (1024 ** 3),
+        free / (1024 ** 3),
     )
 
 
-def empty_recycle_bin() -> None:
-    """Empties the Recycle Bin using the native Windows API."""
-    print("--- Emptying Recycle Bin ---")
-    
-    # We are calling a C-function built into Windows called SHEmptyRecycleBinW
-    # It takes a flag (a number) that tells Windows how to behave:
-    # 1 = No confirmation popups asking "Are you sure?"
-    # 2 = No progress bar UI
-    # 4 = No sound effects
-    # By adding them together (1 + 2 + 4 = 7), we tell Windows to do it completely silently.
-    try:
-        result = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 7)
-        # If the function returns 0, it means success.
-        if result == 0:
-            print("Recycle Bin successfully emptied.")
-        else:
-            print("Recycle Bin is already empty.")
-    except Exception as e:
-        print(f"Error emptying Recycle Bin: {e}")
+# ============================================================
+# DISPLAY HELPERS
+# ============================================================
+
+def print_header(title: str) -> None:
+    """Print a formatted section header."""
+
+    print()
+    print("=" * 60)
+    print(title)
+    print("=" * 60)
 
 
-def main() -> None:
-    # 1. Warn the user if they forgot to run as Admin
-    if not is_admin():
-        print(
-            "NOTE: Script is not running as Administrator. Cleanup of Windows Update "
-            "caches and Prefetch folders will be skipped.\n"
+def format_size(size_bytes: int) -> str:
+    """Convert bytes to a human-readable size."""
+
+    units = ["B", "KB", "MB", "GB", "TB"]
+
+    size = float(size_bytes)
+
+    for unit in units:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+
+        size /= 1024
+
+    return f"{size:.2f} PB"
+
+
+# ============================================================
+# CLEANUP PATHS
+# ============================================================
+
+def get_cleanup_paths() -> List[Path]:
+    """
+    Return Windows folders that are generally safe cleanup targets.
+
+    Some locations are optional because they can have side effects.
+    """
+
+    paths = [
+        # User temporary files
+        r"%TEMP%",
+
+        # Windows temporary files
+        r"%SystemRoot%\Temp",
+
+        # Crash dumps
+        r"%LOCALAPPDATA%\CrashDumps",
+
+        # Windows Error Reporting
+        r"%ProgramData%\Microsoft\Windows\WER\ReportArchive",
+        r"%ProgramData%\Microsoft\Windows\WER\ReportQueue",
+    ]
+
+    if CLEAN_WINDOWS_UPDATE_CACHE:
+        paths.append(
+            r"%SystemRoot%\SoftwareDistribution\Download"
         )
 
-    # 2. Check current drive space
-    free_percent, free_gb = get_free_space(DRIVE)
-    print(f"Drive: {DRIVE} | Free space: {free_percent:.2f}% ({free_gb:.2f} GB)")
+    if CLEAN_PREFETCH:
+        paths.append(
+            r"%SystemRoot%\Prefetch"
+        )
 
-    # This variable determines if we actually run the cleaning functions
-    run_cleanup = False
+    if CLEAN_BROWSER_CACHES:
+        paths.extend(
+            [
+                # Chrome
+                r"%LOCALAPPDATA%\Google\Chrome\User Data\Default\Cache",
 
-    # 3. Check if we are below the threshold (automatic trigger)
+                # Edge
+                r"%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Cache",
+
+                # Firefox
+                r"%LOCALAPPDATA%\Mozilla\Firefox\Profiles",
+            ]
+        )
+
+    expanded_paths = []
+
+    for path_string in paths:
+        expanded = os.path.expandvars(path_string)
+        path = Path(expanded)
+
+        if path not in expanded_paths:
+            expanded_paths.append(path)
+
+    return expanded_paths
+
+
+# ============================================================
+# DIRECTORY SIZE
+# ============================================================
+
+def calculate_directory_size(directory: Path) -> int:
+    """Calculate the total size of a directory."""
+
+    total_size = 0
+
+    if not directory.exists():
+        return 0
+
+    try:
+        for item in directory.rglob("*"):
+            try:
+                if item.is_file() and not item.is_symlink():
+                    total_size += item.stat().st_size
+            except (PermissionError, OSError):
+                continue
+
+    except (PermissionError, OSError):
+        pass
+
+    return total_size
+
+
+# ============================================================
+# SAFE FILE DELETION
+# ============================================================
+
+def delete_file(
+    file_path: Path,
+    stats: CleanupStats,
+) -> None:
+    """Safely delete a single file."""
+
+    try:
+        if not file_path.exists() and not file_path.is_symlink():
+            return
+
+        try:
+            file_size = file_path.stat().st_size
+        except (PermissionError, OSError):
+            file_size = 0
+
+        if DRY_RUN:
+            print(f"[DRY RUN] Would delete: {file_path}")
+            return
+
+        file_path.unlink(missing_ok=True)
+
+        stats.files_deleted += 1
+        stats.bytes_recovered += file_size
+
+        logger.info("Deleted file: %s", file_path)
+
+    except (PermissionError, OSError) as exc:
+        stats.files_failed += 1
+        logger.warning(
+            "Could not delete file %s: %s",
+            file_path,
+            exc,
+        )
+
+
+# ============================================================
+# SAFE DIRECTORY DELETION
+# ============================================================
+
+def delete_directory(
+    directory: Path,
+    stats: CleanupStats,
+) -> None:
+    """Safely delete a directory and its contents."""
+
+    try:
+        directory_size = calculate_directory_size(directory)
+
+        if DRY_RUN:
+            print(
+                f"[DRY RUN] Would delete directory: "
+                f"{directory} ({format_size(directory_size)})"
+            )
+            return
+
+        shutil.rmtree(directory)
+
+        stats.directories_deleted += 1
+        stats.bytes_recovered += directory_size
+
+        logger.info(
+            "Deleted directory: %s (%s)",
+            directory,
+            format_size(directory_size),
+        )
+
+    except (PermissionError, OSError) as exc:
+        stats.directories_failed += 1
+
+        logger.warning(
+            "Could not delete directory %s: %s",
+            directory,
+            exc,
+        )
+
+
+# ============================================================
+# CLEAN DIRECTORY CONTENTS
+# ============================================================
+
+def clean_directory(
+    directory: Path,
+    stats: CleanupStats,
+) -> None:
+    """Clean the contents of a directory without deleting the root folder."""
+
+    if not directory.exists():
+        return
+
+    if not directory.is_dir():
+        return
+
+    print(f"\nCleaning: {directory}")
+
+    try:
+        items = list(directory.iterdir())
+    except (PermissionError, OSError) as exc:
+        print(f"  Access denied: {exc}")
+        logger.warning(
+            "Cannot access directory %s: %s",
+            directory,
+            exc,
+        )
+        return
+
+    for item in items:
+
+        if item.is_symlink():
+            delete_file(item, stats)
+
+        elif item.is_file():
+            delete_file(item, stats)
+
+        elif item.is_dir():
+            delete_directory(item, stats)
+
+
+# ============================================================
+# OLD CRASH DUMP CLEANUP
+# ============================================================
+
+def clean_old_crash_dumps(stats: CleanupStats) -> None:
+    """
+    Delete crash dumps older than CRASH_DUMP_MAX_AGE_DAYS.
+    """
+
+    crash_dir = Path(
+        os.path.expandvars(
+            r"%LOCALAPPDATA%\CrashDumps"
+        )
+    )
+
+    if not crash_dir.exists():
+        return
+
+    print(
+        f"\nChecking old crash dumps "
+        f"(older than {CRASH_DUMP_MAX_AGE_DAYS} days)..."
+    )
+
+    import time
+
+    cutoff_time = time.time() - (
+        CRASH_DUMP_MAX_AGE_DAYS * 24 * 60 * 60
+    )
+
+    try:
+        for item in crash_dir.iterdir():
+
+            if not item.is_file():
+                continue
+
+            try:
+                modified_time = item.stat().st_mtime
+
+                if modified_time < cutoff_time:
+                    delete_file(item, stats)
+
+            except (PermissionError, OSError):
+                stats.files_failed += 1
+
+    except (PermissionError, OSError) as exc:
+        logger.warning(
+            "Unable to scan crash dump directory: %s",
+            exc,
+        )
+
+
+# ============================================================
+# RECYCLE BIN
+# ============================================================
+
+def empty_recycle_bin() -> bool:
+    """Empty the Windows Recycle Bin."""
+
+    if not CLEAN_RECYCLE_BIN:
+        print("Recycle Bin cleanup disabled.")
+        return False
+
+    print("\nEmptying Recycle Bin...")
+
+    if DRY_RUN:
+        print("[DRY RUN] Would empty Recycle Bin.")
+        return True
+
+    try:
+        # SHERB_NOCONFIRMATION = 0x00000001
+        # SHERB_NOPROGRESSUI  = 0x00000002
+        # SHERB_NOSOUND       = 0x00000004
+
+        flags = 0x00000001 | 0x00000002 | 0x00000004
+
+        result = ctypes.windll.shell32.SHEmptyRecycleBinW(
+            None,
+            None,
+            flags,
+        )
+
+        if result == 0:
+            print("Recycle Bin emptied successfully.")
+            logger.info("Recycle Bin emptied.")
+            return True
+
+        print("Recycle Bin could not be emptied.")
+        return False
+
+    except Exception as exc:
+        print(f"Recycle Bin error: {exc}")
+        logger.exception("Recycle Bin cleanup failed.")
+        return False
+
+
+# ============================================================
+# CLEANUP ENGINE
+# ============================================================
+
+def clear_junk_folders() -> CleanupStats:
+    """Clean all configured junk locations."""
+
+    stats = CleanupStats()
+
+    print_header("CLEANUP")
+
+    cleanup_paths = get_cleanup_paths()
+
+    for directory in cleanup_paths:
+        clean_directory(directory, stats)
+
+    clean_old_crash_dumps(stats)
+
+    return stats
+
+
+# ============================================================
+# CLEANUP SUMMARY
+# ============================================================
+
+def print_cleanup_summary(
+    stats: CleanupStats,
+    old_free_gb: float,
+    new_free_gb: float,
+) -> None:
+    """Print the final cleanup report."""
+
+    print_header("CLEANUP SUMMARY")
+
+    actual_recovered = new_free_gb - old_free_gb
+
+    print(
+        f"Files deleted:        {stats.files_deleted}"
+    )
+
+    print(
+        f"Folders deleted:      {stats.directories_deleted}"
+    )
+
+    print(
+        f"Failed file deletes:  {stats.files_failed}"
+    )
+
+    print(
+        f"Failed folder deletes:{stats.directories_failed}"
+    )
+
+    print(
+        f"Estimated recovered:  "
+        f"{format_size(stats.bytes_recovered)}"
+    )
+
+    print(
+        f"Actual disk recovery: "
+        f"{actual_recovered:.2f} GB"
+    )
+
+    print(
+        f"Free space now:       "
+        f"{new_free_gb:.2f} GB"
+    )
+
+
+# ============================================================
+# SYSTEM INFORMATION
+# ============================================================
+
+def show_system_info() -> None:
+    """Display useful disk/system information."""
+
+    print_header("SYSTEM INFORMATION")
+
+    total, used, free = get_disk_usage(DRIVE)
+
+    free_percent, _ = get_free_space(DRIVE)
+
+    print(f"Drive:          {DRIVE}")
+    print(f"Total space:    {total:.2f} GB")
+    print(f"Used space:     {used:.2f} GB")
+    print(f"Free space:     {free:.2f} GB")
+    print(f"Free percent:   {free_percent:.2f}%")
+    print(f"Administrator:  {'Yes' if is_admin() else 'No'}")
+    print(f"Dry-run mode:   {'Yes' if DRY_RUN else 'No'}")
+
+
+# ============================================================
+# USER CONFIRMATION
+# ============================================================
+
+def ask_confirmation(message: str) -> bool:
+    """Ask the user for confirmation."""
+
+    while True:
+
+        answer = input(
+            f"{message} (y/n): "
+        ).strip().lower()
+
+        if answer in {"y", "yes"}:
+            return True
+
+        if answer in {"n", "no"}:
+            return False
+
+        print("Please enter y or n.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+    """Main application entry point."""
+
+    logger.info("Disk cleanup utility started.")
+
+    print_header("WINDOWS DISK CLEANUP UTILITY")
+
+    if os.name != "nt":
+        print(
+            "This program is designed for Windows."
+        )
+        return
+
+    show_system_info()
+
+    if not is_admin():
+        print(
+            "\nWARNING:"
+            "\nThe program is not running as Administrator."
+            "\nSome Windows folders may be inaccessible."
+        )
+
+    free_percent, old_free_gb = get_free_space(DRIVE)
+
+    print(
+        f"\nCurrent free space: "
+        f"{free_percent:.2f}% "
+        f"({old_free_gb:.2f} GB)"
+    )
+
+    # --------------------------------------------------------
+    # AUTOMATIC CLEANUP
+    # --------------------------------------------------------
+
     if free_percent < THRESHOLD_PERCENT:
-        print(f"\nWARNING: Free space is below {THRESHOLD_PERCENT}%! Starting cleanup...\n")
+
+        print(
+            f"\nWARNING: Free space is below "
+            f"{THRESHOLD_PERCENT}%."
+        )
+
+        print(
+            "Automatic cleanup has been triggered."
+        )
+
         run_cleanup = True
+
+    # --------------------------------------------------------
+    # MANUAL CLEANUP
+    # --------------------------------------------------------
+
     else:
-        # 4. If space is fine, ask the user if they want to clean anyway (manual trigger)
-        print(f"\nSufficient free space available (Threshold: {THRESHOLD_PERCENT}%).")
-        
-        # input() pauses the script and waits for the user to type something.
-        # .strip() removes accidental spaces, .lower() makes 'Y' into 'y'
-        user_input = input("Would you like to force the cleanup anyway? (y/n): ").strip().lower()
-        
-        if user_input == 'y':
-            print("\nStarting manual cleanup...\n")
-            run_cleanup = True
-        else:
-            print("Cleanup skipped. Exiting script.")
 
-    # 5. Execute the cleanup if it was triggered (either automatically or manually)
-    if run_cleanup:
-        clear_junk_folders()
-        print("") # Prints a blank line for readability
-        empty_recycle_bin()
+        print(
+            f"\nFree space is above the "
+            f"{THRESHOLD_PERCENT}% threshold."
+        )
 
-        # 6. Recalculate space to show the user how much was saved
-        new_percent, new_gb = get_free_space(DRIVE)
-        print(f"\nCleanup complete! New free space: {new_percent:.2f}% ({new_gb:.2f} GB)")
-        
-        # Simple math: New free space minus old free space = amount recovered
-        print(f"Total space recovered: {(new_gb - free_gb):.2f} GB")
+        run_cleanup = ask_confirmation(
+            "Would you like to run cleanup anyway?"
+        )
+
+    if not run_cleanup:
+
+        print("\nCleanup cancelled.")
+        logger.info("Cleanup cancelled by user.")
+        return
+
+    # --------------------------------------------------------
+    # DRY RUN CONFIRMATION
+    # --------------------------------------------------------
+
+    if DRY_RUN:
+        print(
+            "\nDRY-RUN MODE ENABLED."
+            "\nNo files will actually be deleted."
+        )
+
+    # --------------------------------------------------------
+    # RUN CLEANUP
+    # --------------------------------------------------------
+
+    stats = clear_junk_folders()
+
+    empty_recycle_bin()
+
+    # --------------------------------------------------------
+    # FINAL DISK CHECK
+    # --------------------------------------------------------
+
+    new_percent, new_free_gb = get_free_space(DRIVE)
+
+    print_cleanup_summary(
+        stats,
+        old_free_gb,
+        new_free_gb,
+    )
+
+    print(
+        f"\nFree space percentage: "
+        f"{new_percent:.2f}%"
+    )
+
+    logger.info(
+        "Cleanup completed. Recovered approximately %.2f GB.",
+        new_free_gb - old_free_gb,
+    )
+
+    print(
+        "\nLog file:"
+        f"\n{LOG_FILE.resolve()}"
+    )
+
+    print("\nDone.")
 
 
-# This is the standard Python entry point. It ensures main() only runs 
-# if you execute this file directly, rather than importing it into another script.
+# ============================================================
+# PROGRAM ENTRY POINT
+# ============================================================
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except KeyboardInterrupt:
+        print("\n\nOperation cancelled by user.")
+        logger.info("Program interrupted by user.")
+
+    except Exception as exc:
+        print(
+            f"\nUnexpected error: {exc}"
+        )
+        logger.exception(
+            "Unhandled application error."
+        )
+
+        sys.exit(1)
